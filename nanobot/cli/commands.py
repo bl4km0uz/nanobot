@@ -403,7 +403,7 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config):
+def _make_provider(config: Config, model_override: str | None = None):
     """Create the appropriate LLM provider from config.
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
@@ -411,9 +411,16 @@ def _make_provider(config: Config):
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.registry import find_by_name
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
+    effective_config = config
+    # When a model override is provided, route by that model string even if the
+    # global default provider is pinned in config.
+    if model_override and config.agents.defaults.provider != "auto":
+        effective_config = config.model_copy(deep=True)
+        effective_config.agents.defaults.provider = "auto"
+
+    model = model_override or config.agents.defaults.model
+    provider_name = effective_config.get_provider_name(model)
+    p = effective_config.get_provider(model)
     spec = find_by_name(provider_name) if provider_name else None
     backend = spec.backend if spec else "openai_compat"
 
@@ -453,7 +460,7 @@ def _make_provider(config: Config):
 
         provider = AnthropicProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
+            api_base=effective_config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
         )
@@ -462,7 +469,7 @@ def _make_provider(config: Config):
 
         provider = OpenAICompatProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
+            api_base=effective_config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
             spec=spec,
@@ -816,10 +823,16 @@ def _run_gateway(
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     hb_cfg = config.gateway.heartbeat
+    hb_model = hb_cfg.model_override or agent.model
+    heartbeat_provider = (
+        _make_provider(config, model_override=hb_model)
+        if hb_cfg.model_override
+        else provider
+    )
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
-        provider=provider,
-        model=agent.model,
+        provider=heartbeat_provider,
+        model=hb_model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,

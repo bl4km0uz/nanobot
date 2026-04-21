@@ -470,6 +470,30 @@ def test_make_provider_passes_extra_headers_to_custom_provider():
     assert kwargs["default_headers"]["x-session-affinity"] == "sticky-session"
 
 
+def test_make_provider_uses_model_override_for_provider_routing():
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "anthropic",
+                    "model": "anthropic/claude-opus-4-5",
+                }
+            },
+            "providers": {
+                "anthropic": {"apiKey": "sk-ant"},
+                "openai": {"apiKey": "sk-openai"},
+            },
+        }
+    )
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = _make_provider(config, model_override="openai/gpt-4.1-mini")
+
+    assert provider.__class__.__name__ == "OpenAICompatProvider"
+    assert provider.get_default_model() == "openai/gpt-4.1-mini"
+    assert config.agents.defaults.provider == "anthropic"
+
+
 @pytest.fixture
 def mock_agent_runtime(tmp_path):
     """Mock agent command dependencies for focused CLI tests."""
@@ -800,7 +824,7 @@ def _patch_cli_command_runtime(
     )
     monkeypatch.setattr(
         "nanobot.cli.commands._make_provider",
-        make_provider or (lambda _config: object()),
+        make_provider or (lambda _config, model_override=None: object()),
     )
 
     if message_bus is not None:
@@ -1417,6 +1441,123 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
     assert missing_writer.closed is True
     assert "HTTP/1.0 404 Not Found" in missing_response
     assert missing_response.endswith("\r\n\r\nNot Found")
+
+
+def test_gateway_heartbeat_model_override_uses_dedicated_provider(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "anthropic/claude-opus-4-5"}},
+            "providers": {
+                "anthropic": {"apiKey": "sk-ant"},
+                "openai": {"apiKey": "sk-openai"},
+            },
+            "gateway": {"heartbeat": {"modelOverride": "openai/gpt-4.1-mini"}},
+        }
+    )
+    provider_calls: list[tuple[str | None, object]] = []
+    captured_hb: dict[str, object] = {}
+
+    def _capturing_make_provider(_config, model_override=None):
+        provider = object()
+        provider_calls.append((model_override, provider))
+        return provider
+
+    class _FakeDream:
+        model = None
+        max_batch_size = 0
+        max_iterations = 0
+        annotate_line_ages = True
+
+        async def run(self) -> None:
+            return None
+
+    class _FakeAgentLoop:
+        def __init__(self, **kwargs) -> None:
+            self.model = kwargs["model"]
+            self.dream = _FakeDream()
+            self.sessions = MagicMock()
+            self.sessions.get_or_create.return_value = MagicMock()
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        async def close_mcp(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        def __init__(self, _config, _bus, **_kwargs) -> None:
+            self.enabled_channels = []
+
+        async def start_all(self) -> None:
+            await asyncio.Event().wait()
+
+        async def stop_all(self) -> None:
+            return None
+
+    class _FakeCronService:
+        def __init__(self, _store_path: Path) -> None:
+            self.on_job = None
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> dict[str, int]:
+            return {"jobs": 0}
+
+        def register_system_job(self, _job) -> None:
+            return None
+
+    class _FakeHeartbeatService:
+        def __init__(self, **kwargs) -> None:
+            captured_hb.update(kwargs)
+
+        async def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class _FakeServer:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def serve_forever(self) -> None:
+            raise _StopGatewayError("stop")
+
+    async def _fake_start_server(_handler, _host: str, _port: int):
+        return _FakeServer()
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        make_provider=_capturing_make_provider,
+        message_bus=lambda: object(),
+        session_manager=lambda _workspace: object(),
+    )
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
+    monkeypatch.setattr("asyncio.start_server", _fake_start_server)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert [call[0] for call in provider_calls] == [None, "openai/gpt-4.1-mini"]
+    assert captured_hb["model"] == "openai/gpt-4.1-mini"
+    assert captured_hb["provider"] is provider_calls[1][1]
 
 
 def test_serve_uses_api_config_defaults_and_workspace_override(
