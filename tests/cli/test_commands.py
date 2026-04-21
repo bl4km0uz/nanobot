@@ -491,6 +491,7 @@ def test_make_provider_uses_model_override_for_provider_routing():
 
     assert provider.__class__.__name__ == "OpenAICompatProvider"
     assert provider.get_default_model() == "openai/gpt-4.1-mini"
+    assert config.agents.defaults.provider == "anthropic"
 
 
 @pytest.fixture

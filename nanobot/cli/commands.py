@@ -411,9 +411,16 @@ def _make_provider(config: Config, model_override: str | None = None):
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.registry import find_by_name
 
+    effective_config = config
+    # When a model override is provided, route by that model string even if the
+    # global default provider is pinned in config.
+    if model_override and config.agents.defaults.provider != "auto":
+        effective_config = config.model_copy(deep=True)
+        effective_config.agents.defaults.provider = "auto"
+
     model = model_override or config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
+    provider_name = effective_config.get_provider_name(model)
+    p = effective_config.get_provider(model)
     spec = find_by_name(provider_name) if provider_name else None
     backend = spec.backend if spec else "openai_compat"
 
@@ -453,7 +460,7 @@ def _make_provider(config: Config, model_override: str | None = None):
 
         provider = AnthropicProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
+            api_base=effective_config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
         )
@@ -462,7 +469,7 @@ def _make_provider(config: Config, model_override: str | None = None):
 
         provider = OpenAICompatProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
+            api_base=effective_config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
             spec=spec,
