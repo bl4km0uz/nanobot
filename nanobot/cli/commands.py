@@ -707,6 +707,8 @@ def _run_gateway(
         tools_config=config.tools,
     )
 
+    heartbeat_agent = agent
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
@@ -777,16 +779,21 @@ def _run_gateway(
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
+        if not hasattr(session_manager, "list_sessions"):
+            return "cli", "direct"
         # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
+        try:
+            for item in session_manager.list_sessions():
+                key = item.get("key") or ""
+                if ":" not in key:
+                    continue
+                channel, chat_id = key.split(":", 1)
+                if channel in {"cli", "system"}:
+                    continue
+                if channel in enabled and chat_id:
+                    return channel, chat_id
+        except Exception:
+            return "cli", "direct"
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
@@ -798,7 +805,7 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        resp = await agent.process_direct(
+        resp = await heartbeat_agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
@@ -808,9 +815,9 @@ def _run_gateway(
 
         # Keep a small tail of heartbeat history so the loop stays bounded
         # without losing all short-term context between runs.
-        session = agent.sessions.get_or_create("heartbeat")
+        session = heartbeat_agent.sessions.get_or_create("heartbeat")
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
-        agent.sessions.save(session)
+        heartbeat_agent.sessions.save(session)
 
         return resp.content if resp else ""
 
@@ -829,6 +836,29 @@ def _run_gateway(
         if hb_cfg.model_override
         else provider
     )
+    if hb_cfg.model_override:
+        heartbeat_agent = AgentLoop(
+            bus=bus,
+            provider=heartbeat_provider,
+            workspace=config.workspace_path,
+            model=hb_model,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            web_config=config.tools.web,
+            context_block_limit=config.agents.defaults.context_block_limit,
+            max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
+            provider_retry_mode=config.agents.defaults.provider_retry_mode,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=config.agents.defaults.timezone,
+            unified_session=config.agents.defaults.unified_session,
+            disabled_skills=config.agents.defaults.disabled_skills,
+            session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+            tools_config=config.tools,
+        )
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=heartbeat_provider,
@@ -954,9 +984,13 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            if heartbeat_agent is not agent:
+                await heartbeat_agent.close_mcp()
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
+            if heartbeat_agent is not agent:
+                heartbeat_agent.stop()
             agent.stop()
             await channels.stop_all()
 
