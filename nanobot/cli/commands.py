@@ -880,6 +880,8 @@ def _run_gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    if hb_cfg.model_override:
+        console.print(f"[green]✓[/green] Heartbeat model override: {hb_model}")
 
     async def _health_server(host: str, health_port: int):
         """Lightweight HTTP health endpoint on the gateway port."""
